@@ -1,4 +1,4 @@
-FROM jc21/nginx-proxy-manager-base:latest
+FROM vsc55/nginx-proxy-manager-base:latest
 
 MAINTAINER Jamie Curnow <jc@jc21.com>
 LABEL maintainer="Jamie Curnow <jc@jc21.com>"
