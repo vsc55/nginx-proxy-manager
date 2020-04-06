@@ -1,364 +1,235 @@
 pipeline {
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '10'))
-    disableConcurrentBuilds()
-  }
-  agent any
-  environment {
-    IMAGE            = "nginx-proxy-manager"
-    BASE_IMAGE       = "jc21/${IMAGE}-base"
-    TEMP_IMAGE       = "${IMAGE}-build_${BUILD_NUMBER}"
-    TAG_VERSION      = getPackageVersion()
-    MAJOR_VERSION    = "2"
-    BRANCH_LOWER     = "${BRANCH_NAME.toLowerCase()}"
-    // Architectures:
-    AMD64_TAG        = "amd64"
-    ARMV6_TAG        = "armv6l"
-    ARMV7_TAG        = "armv7l"
-    ARM64_TAG        = "arm64"
-  }
-  stages {
-    stage('Build PR') {
-      when {
-        changeRequest()
-      }
-      steps {
-        ansiColor('xterm') {
-          // Codebase
-          sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install'
-          sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} npm run-script build'
-          sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} rm -rf node_modules'
-          sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install --prod'
-          sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} node-prune'
+	agent {
+		label 'docker-multiarch'
+	}
+	options {
+		buildDiscarder(logRotator(numToKeepStr: '5'))
+		disableConcurrentBuilds()
+	}
+	environment {
+		IMAGE                      = "nginx-proxy-manager"
+		BUILD_VERSION              = getVersion()
+		MAJOR_VERSION              = "2"
+		BRANCH_LOWER               = "${BRANCH_NAME.toLowerCase().replaceAll('/', '-')}"
+		COMPOSE_PROJECT_NAME       = "npm_${BRANCH_LOWER}_${BUILD_NUMBER}"
+		COMPOSE_FILE               = 'docker/docker-compose.ci.yml'
+		COMPOSE_INTERACTIVE_NO_CLI = 1
+		BUILDX_NAME                = "${COMPOSE_PROJECT_NAME}"
+	}
+	stages {
+		stage('Environment') {
+			parallel {
+				stage('Master') {
+					when {
+						branch 'master'
+					}
+					steps {
+						script {
+							env.BUILDX_PUSH_TAGS = "-t docker.io/jc21/${IMAGE}:${BUILD_VERSION} -t docker.io/jc21/${IMAGE}:${MAJOR_VERSION} -t docker.io/jc21/${IMAGE}:latest"
+						}
+					}
+				}
+				stage('Other') {
+					when {
+						not {
+							branch 'master'
+						}
+					}
+					steps {
+						script {
+							// Defaults to the Branch name, which is applies to all branches AND pr's
+							env.BUILDX_PUSH_TAGS = "-t docker.io/jc21/${IMAGE}:github-${BRANCH_LOWER}"
+						}
+					}
+				}
+				stage('Versions') {
+					steps {
+						sh 'cat frontend/package.json | jq --arg BUILD_VERSION "${BUILD_VERSION}" \'.version = $BUILD_VERSION\' | sponge frontend/package.json'
+						sh 'echo -e "\\E[1;36mFrontend Version is:\\E[1;33m $(cat frontend/package.json | jq -r .version)\\E[0m"'
+						sh 'cat backend/package.json | jq --arg BUILD_VERSION "${BUILD_VERSION}" \'.version = $BUILD_VERSION\' | sponge backend/package.json'
+						sh 'echo -e "\\E[1;36mBackend Version is:\\E[1;33m  $(cat backend/package.json | jq -r .version)\\E[0m"'
+						sh 'sed -i -E "s/(version-)[0-9]+\\.[0-9]+\\.[0-9]+(-green)/\\1${BUILD_VERSION}\\2/" README.md'
+					}
+				}
+			}
+		}
+		stage('Frontend') {
+			steps {
+				ansiColor('xterm') {
+					sh './scripts/frontend-build'
+				}
+			}
+		}
+		stage('Backend') {
+			steps {
+				ansiColor('xterm') {
+					echo 'Checking Syntax ...'
+					// See: https://github.com/yarnpkg/yarn/issues/3254
+					sh '''docker run --rm \\
+						-v "$(pwd)/backend:/app" \\
+						-w /app \\
+						node:latest \\
+						sh -c "yarn install && yarn eslint . && rm -rf node_modules"
+					'''
 
-          // Docker Build
-          sh 'docker build --pull --no-cache --squash --compress -t ${TEMP_IMAGE}-${AMD64_TAG} .'
+					echo 'Docker Build ...'
+					sh '''docker build --pull --no-cache --squash --compress \\
+						-t "${IMAGE}:ci-${BUILD_NUMBER}" \\
+						-f docker/Dockerfile \\
+						--build-arg TARGETPLATFORM=linux/amd64 \\
+						--build-arg BUILDPLATFORM=linux/amd64 \\
+						--build-arg BUILD_VERSION="${BUILD_VERSION}" \\
+						--build-arg BUILD_COMMIT="${BUILD_COMMIT}" \\
+						--build-arg BUILD_DATE="$(date '+%Y-%m-%d %T %Z')" \\
+						.
+					'''
+				}
+			}
+		}
+		stage('Test') {
+			steps {
+				ansiColor('xterm') {
+					// Bring up a stack
+					sh 'docker-compose up -d fullstack'
+					sh './scripts/wait-healthy $(docker-compose ps -q fullstack) 120'
 
-          // Dockerhub
-          sh 'docker tag ${TEMP_IMAGE}-${AMD64_TAG} docker.io/jc21/${IMAGE}:github-${BRANCH_LOWER}-${AMD64_TAG}'
-          withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
-            sh "docker login -u '${duser}' -p '${dpass}'"
-            sh 'docker push docker.io/jc21/${IMAGE}:github-${BRANCH_LOWER}-${AMD64_TAG}'
-          }
+					// Run tests
+					sh 'rm -rf test/results'
+					sh 'docker-compose up cypress'
+					// Get results
+					sh 'docker cp -L "$(docker-compose ps -q cypress):/results" test/'
+				}
+			}
+			post {
+				always {
+					// Dumps to analyze later
+					sh 'mkdir -p debug'
+					sh 'docker-compose logs fullstack | gzip > debug/docker_fullstack.log.gz'
+					sh 'docker-compose logs db | gzip > debug/docker_db.log.gz'
+					// Cypress videos and screenshot artifacts
+					dir(path: 'test/results') {
+						archiveArtifacts allowEmptyArchive: true, artifacts: '**/*', excludes: '**/*.xml'
+					}
+					junit 'test/results/junit/*'
+				}
+			}
+		}
+		stage('Docs') {
+			when {
+				not {
+					equals expected: 'UNSTABLE', actual: currentBuild.result
+				}
+			}
+			steps {
+				ansiColor('xterm') {
+					dir(path: 'docs') {
+						sh 'yarn install'
+						sh 'yarn build'
+					}
 
-          sh 'docker rmi ${TEMP_IMAGE}-${AMD64_TAG}'
+					dir(path: 'docs/.vuepress/dist') {
+						sh 'tar -czf ../../docs.tgz *'
+					}
 
-          script {
-            def comment = pullRequest.comment("Docker Image for build ${BUILD_NUMBER} is available on [DockerHub](https://cloud.docker.com/repository/docker/jc21/${IMAGE}) as `jc21/${IMAGE}:github-${BRANCH_LOWER}-${AMD64_TAG}`")
-          }
-        }
-      }
-    }
-    stage('Build Develop') {
-      when {
-        branch 'develop'
-      }
-      steps {
-        ansiColor('xterm') {
-          // Codebase
-          sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install'
-          sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} npm run-script build'
-          sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} rm -rf node_modules'
-          sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install --prod'
-          sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} node-prune'
+					archiveArtifacts(artifacts: 'docs/docs.tgz', allowEmptyArchive: false)
+				}
+			}
+		}
+		stage('MultiArch Build') {
+			when {
+				not {
+					equals expected: 'UNSTABLE', actual: currentBuild.result
+				}
+			}
+			steps {
+				ansiColor('xterm') {
+					withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
+						sh "docker login -u '${duser}' -p '${dpass}'"
+						// Buildx with push
+						sh "./scripts/buildx --push ${BUILDX_PUSH_TAGS}"
+					}
+				}
+			}
+		}
+		stage('Docs Deploy') {
+			when {
+				allOf {
+					branch 'master'
+					not {
+						equals expected: 'UNSTABLE', actual: currentBuild.result
+					}
+				}
+			}
+			steps {
+				withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'npm-s3-docs', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+					sh """docker run --rm \\
+						--name \${COMPOSE_PROJECT_NAME}-docs-upload \\
+						-e S3_BUCKET=jc21-npm-site \\
+						-e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \\
+						-e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \\
+						-v \$(pwd):/app \\
+						-w /app \\
+						jc21/ci-tools \\
+						scripts/docs-upload /app/docs/.vuepress/dist/
+					"""
 
-          // Docker Build
-          sh 'docker build --pull --no-cache --squash --compress -t ${TEMP_IMAGE}-${AMD64_TAG} .'
-
-          // Dockerhub
-          sh 'docker tag ${TEMP_IMAGE}-${AMD64_TAG} docker.io/jc21/${IMAGE}:develop-${AMD64_TAG}'
-          withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
-            sh "docker login -u '${duser}' -p '${dpass}'"
-            sh 'docker push docker.io/jc21/${IMAGE}:develop-${AMD64_TAG}'
-          }
-
-          sh 'docker rmi ${TEMP_IMAGE}-${AMD64_TAG}'
-        }
-      }
-    }
-    stage('Build Master') {
-      when {
-        branch 'master'
-      }
-      parallel {
-        // ========================
-        // amd64
-        // ========================
-        stage('amd64') {
-          agent {
-            label 'amd64'
-          }
-          steps {
-            ansiColor('xterm') {
-              // Codebase
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} npm run-script build'
-              sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} rm -rf node_modules'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install --prod'
-              sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} node-prune'
-
-              // Docker Build
-              sh 'docker build --pull --no-cache --squash --compress -t ${TEMP_IMAGE}-${AMD64_TAG} .'
-
-              // Dockerhub
-              sh 'docker tag ${TEMP_IMAGE}-${AMD64_TAG} docker.io/jc21/${IMAGE}:${TAG_VERSION}-${AMD64_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${AMD64_TAG} docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${AMD64_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${AMD64_TAG} docker.io/jc21/${IMAGE}:latest-${AMD64_TAG}'
-
-              withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
-                sh "docker login -u '${duser}' -p '${dpass}'"
-                sh 'docker push docker.io/jc21/${IMAGE}:${TAG_VERSION}-${AMD64_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${AMD64_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:latest-${AMD64_TAG}'
-              }
-
-              sh 'docker rmi ${TEMP_IMAGE}-${AMD64_TAG}'
-            }
-          }
-        }
-        // ========================
-        // arm64
-        // ========================
-        stage('arm64') {
-          agent {
-            label 'arm64'
-          }
-          steps {
-            ansiColor('xterm') {
-              // Codebase
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} npm run-script build'
-              sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} rm -rf node_modules'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install --prod'
-
-              // Docker Build
-              sh 'docker build --pull --no-cache --squash --compress -t ${TEMP_IMAGE}-${ARM64_TAG} -f Dockerfile.${ARM64_TAG} .'
-
-              // Dockerhub
-              sh 'docker tag ${TEMP_IMAGE}-${ARM64_TAG} docker.io/jc21/${IMAGE}:${TAG_VERSION}-${ARM64_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${ARM64_TAG} docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${ARM64_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${ARM64_TAG} docker.io/jc21/${IMAGE}:latest-${ARM64_TAG}'
-
-              withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
-                sh "docker login -u '${duser}' -p '${dpass}'"
-                sh 'docker push docker.io/jc21/${IMAGE}:${TAG_VERSION}-${ARM64_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${ARM64_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:latest-${ARM64_TAG}'
-              }
-
-              sh 'docker rmi ${TEMP_IMAGE}-${ARM64_TAG}'
-            }
-          }
-        }
-        // ========================
-        // armv7l
-        // ========================
-        stage('armv7l') {
-          agent {
-            label 'armv7l'
-          }
-          steps {
-            ansiColor('xterm') {
-              // Codebase
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} npm run-script build'
-              sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} rm -rf node_modules'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install --prod'
-
-              // Docker Build
-              sh 'docker build --pull --no-cache --squash --compress -t ${TEMP_IMAGE}-${ARMV7_TAG} -f Dockerfile.${ARMV7_TAG} .'
-
-              // Dockerhub
-              sh 'docker tag ${TEMP_IMAGE}-${ARMV7_TAG} docker.io/jc21/${IMAGE}:${TAG_VERSION}-${ARMV7_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${ARMV7_TAG} docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV7_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${ARMV7_TAG} docker.io/jc21/${IMAGE}:latest-${ARMV7_TAG}'
-
-              withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
-                sh "docker login -u '${duser}' -p '${dpass}'"
-                sh 'docker push docker.io/jc21/${IMAGE}:${TAG_VERSION}-${ARMV7_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV7_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:latest-${ARMV7_TAG}'
-              }
-
-              sh 'docker rmi ${TEMP_IMAGE}-${ARMV7_TAG}'
-            }
-          }
-        }
-        // ========================
-        // armv6l - Disabled for the time being
-        // ========================
-        /*
-        stage('armv6l') {
-          agent {
-            label 'armv6l'
-          }
-          steps {
-            ansiColor('xterm') {
-              // Codebase
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} npm run-script build'
-              sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} rm -rf node_modules'
-              sh 'docker run --rm -v $(pwd):/app -w /app ${BASE_IMAGE} yarn install --prod'
-
-              // Docker Build
-              sh 'docker build --pull --no-cache --squash --compress -t ${TEMP_IMAGE}-${ARMV6_TAG} -f Dockerfile.${ARMV6_TAG} .'
-
-              // Dockerhub
-              sh 'docker tag ${TEMP_IMAGE}-${ARMV6_TAG} docker.io/jc21/${IMAGE}:${TAG_VERSION}-${ARMV6_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${ARMV6_TAG} docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV6_TAG}'
-              sh 'docker tag ${TEMP_IMAGE}-${ARMV6_TAG} docker.io/jc21/${IMAGE}:latest-${ARMV6_TAG}'
-
-              withCredentials([usernamePassword(credentialsId: 'jc21-dockerhub', passwordVariable: 'dpass', usernameVariable: 'duser')]) {
-                sh "docker login -u '${duser}' -p '${dpass}'"
-                sh 'docker push docker.io/jc21/${IMAGE}:${TAG_VERSION}-${ARMV6_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV6_TAG}'
-                sh 'docker push docker.io/jc21/${IMAGE}:latest-${ARMV6_TAG}'
-              }
-
-              sh 'docker rmi ${TEMP_IMAGE}-${ARMV6_TAG}'
-            }
-          }
-        }
-        */
-      }
-    }
-    // ========================
-    // latest manifest
-    // ========================
-    stage('Latest Manifest') {
-      when {
-        branch 'master'
-      }
-      steps {
-        ansiColor('xterm') {
-          // =======================
-          // latest
-          // =======================
-          sh 'docker pull jc21/${IMAGE}:latest-${AMD64_TAG}'
-          sh 'docker pull jc21/${IMAGE}:latest-${ARM64_TAG}'
-          sh 'docker pull jc21/${IMAGE}:latest-${ARMV7_TAG}'
-          //sh 'docker pull jc21/${IMAGE}:latest-${ARMV6_TAG}'
-
-          sh 'docker manifest push --purge jc21/${IMAGE}:latest || echo ""'
-          sh 'docker manifest create jc21/${IMAGE}:latest jc21/${IMAGE}:latest-${AMD64_TAG} jc21/${IMAGE}:latest-${ARM64_TAG} jc21/${IMAGE}:latest-${ARMV7_TAG}'
-
-          sh 'docker manifest annotate jc21/${IMAGE}:latest jc21/${IMAGE}:latest-${AMD64_TAG} --arch ${AMD64_TAG}'
-          sh 'docker manifest annotate jc21/${IMAGE}:latest jc21/${IMAGE}:latest-${ARM64_TAG} --os linux --arch ${ARM64_TAG}'
-          sh 'docker manifest annotate jc21/${IMAGE}:latest jc21/${IMAGE}:latest-${ARMV7_TAG} --os linux --arch arm --variant ${ARMV7_TAG}'
-          //sh 'docker manifest annotate jc21/${IMAGE}:latest jc21/${IMAGE}:latest-${ARMV6_TAG} --os linux --arch arm --variant ${ARMV6_TAG}'
-          sh 'docker manifest push --purge jc21/${IMAGE}:latest'
-
-          // =======================
-          // major version
-          // =======================
-          sh 'docker pull jc21/${IMAGE}:${MAJOR_VERSION}-${AMD64_TAG}'
-          sh 'docker pull jc21/${IMAGE}:${MAJOR_VERSION}-${ARM64_TAG}'
-          sh 'docker pull jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV7_TAG}'
-          //sh 'docker pull jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV6_TAG}'
-
-          sh 'docker manifest push --purge jc21/${IMAGE}:${MAJOR_VERSION} || echo ""'
-          sh 'docker manifest create jc21/${IMAGE}:${MAJOR_VERSION} jc21/${IMAGE}:${MAJOR_VERSION}-${AMD64_TAG} jc21/${IMAGE}:${MAJOR_VERSION}-${ARM64_TAG} jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV7_TAG}'
-
-          sh 'docker manifest annotate jc21/${IMAGE}:${MAJOR_VERSION} jc21/${IMAGE}:${MAJOR_VERSION}-${AMD64_TAG} --arch ${AMD64_TAG}'
-          sh 'docker manifest annotate jc21/${IMAGE}:${MAJOR_VERSION} jc21/${IMAGE}:${MAJOR_VERSION}-${ARM64_TAG} --os linux --arch ${ARM64_TAG}'
-          sh 'docker manifest annotate jc21/${IMAGE}:${MAJOR_VERSION} jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV7_TAG} --os linux --arch arm --variant ${ARMV7_TAG}'
-          //sh 'docker manifest annotate jc21/${IMAGE}:${MAJOR_VERSION} jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV6_TAG} --os linux --arch arm --variant ${ARMV6_TAG}'
-
-          // =======================
-          // version
-          // =======================
-          sh 'docker pull jc21/${IMAGE}:${TAG_VERSION}-${AMD64_TAG}'
-          sh 'docker pull jc21/${IMAGE}:${TAG_VERSION}-${ARM64_TAG}'
-          sh 'docker pull jc21/${IMAGE}:${TAG_VERSION}-${ARMV7_TAG}'
-          //sh 'docker pull jc21/${IMAGE}:${TAG_VERSION}-${ARMV6_TAG}'
-
-          sh 'docker manifest push --purge jc21/${IMAGE}:${TAG_VERSION} || echo ""'
-          sh 'docker manifest create jc21/${IMAGE}:${TAG_VERSION} jc21/${IMAGE}:${TAG_VERSION}-${AMD64_TAG} jc21/${IMAGE}:${TAG_VERSION}-${ARM64_TAG} jc21/${IMAGE}:${TAG_VERSION}-${ARMV7_TAG}'
-
-          sh 'docker manifest annotate jc21/${IMAGE}:${TAG_VERSION} jc21/${IMAGE}:${TAG_VERSION}-${AMD64_TAG} --arch ${AMD64_TAG}'
-          sh 'docker manifest annotate jc21/${IMAGE}:${TAG_VERSION} jc21/${IMAGE}:${TAG_VERSION}-${ARM64_TAG} --os linux --arch ${ARM64_TAG}'
-          sh 'docker manifest annotate jc21/${IMAGE}:${TAG_VERSION} jc21/${IMAGE}:${TAG_VERSION}-${ARMV7_TAG} --os linux --arch arm --variant ${ARMV7_TAG}'
-          //sh 'docker manifest annotate jc21/${IMAGE}:${TAG_VERSION} jc21/${IMAGE}:${TAG_VERSION}-${ARMV6_TAG} --os linux --arch arm --variant ${ARMV6_TAG}'
-        }
-      }
-    }
-    // ========================
-    // develop
-    // ========================
-    stage('Develop Manifest') {
-      when {
-        branch 'develop'
-      }
-      steps {
-        ansiColor('xterm') {
-          sh 'docker pull jc21/${IMAGE}:develop-${AMD64_TAG}'
-          //sh 'docker pull jc21/${IMAGE}:develop-${ARM64_TAG}'
-          //sh 'docker pull jc21/${IMAGE}:develop-${ARMV7_TAG}'
-          //sh 'docker pull jc21/${IMAGE}:${TAG_VERSION}-${ARMV6_TAG}'
-
-          sh 'docker manifest push --purge jc21/${IMAGE}:develop || :'
-          sh 'docker manifest create jc21/${IMAGE}:develop jc21/${IMAGE}:develop-${AMD64_TAG}'
-
-          sh 'docker manifest annotate jc21/${IMAGE}:develop jc21/${IMAGE}:develop-${AMD64_TAG} --arch ${AMD64_TAG}'
-          //sh 'docker manifest annotate jc21/${IMAGE}:develop jc21/${IMAGE}:develop-${ARM64_TAG} --os linux --arch ${ARM64_TAG}'
-          //sh 'docker manifest annotate jc21/${IMAGE}:develop jc21/${IMAGE}:develop-${ARMV7_TAG} --os linux --arch arm --variant ${ARMV7_TAG}'
-          //sh 'docker manifest annotate jc21/${IMAGE}:develop jc21/${IMAGE}:develop-${ARMV6_TAG} --os linux --arch arm --variant ${ARMV6_TAG}'
-        }
-      }
-    }
-    // ========================
-    // cleanup
-    // ========================
-    stage('Latest Cleanup') {
-      when {
-        branch 'master'
-      }
-      steps {
-        ansiColor('xterm') {
-          sh 'docker rmi jc21/${IMAGE}:latest jc21/${IMAGE}:latest-${AMD64_TAG} jc21/${IMAGE}:latest-${ARM64_TAG} jc21/${IMAGE}:latest-${ARMV7_TAG} || echo ""'
-          sh 'docker rmi jc21/${IMAGE}:${MAJOR_VERSION}-${AMD64_TAG} jc21/${IMAGE}:${MAJOR_VERSION}-${ARM64_TAG} jc21/${IMAGE}:${MAJOR_VERSION}-${ARMV7_TAG} || echo ""'
-          sh 'docker rmi jc21/${IMAGE}:${TAG_VERSION}-${AMD64_TAG} jc21/${IMAGE}:${TAG_VERSION}-${ARM64_TAG} jc21/${IMAGE}:${TAG_VERSION}-${ARMV7_TAG} || echo ""'
-        }
-      }
-    }
-    stage('Develop Cleanup') {
-      when {
-        branch 'develop'
-      }
-      steps {
-        ansiColor('xterm') {
-          sh 'docker rmi jc21/${IMAGE}:develop jc21/${IMAGE}:develop-${AMD64_TAG} || echo ""'
-        }
-      }
-    }
-    stage('PR Cleanup') {
-      when {
-        changeRequest()
-      }
-      steps {
-        ansiColor('xterm') {
-          sh 'docker rmi jc21/${IMAGE}:github-${BRANCH_LOWER}-${AMD64_TAG} || echo ""'
-        }
-      }
-    }
-  }
-  post {
-    success {
-      juxtapose event: 'success'
-      sh 'figlet "SUCCESS"'
-    }
-    failure {
-      juxtapose event: 'failure'
-      sh 'figlet "FAILURE"'
-    }
-    always {
-      sh 'echo Reverting ownership'
-      sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} chown -R $(id -u):$(id -g) /data'
-    }
-  }
+					sh """docker run --rm \\
+						--name \${COMPOSE_PROJECT_NAME}-docs-invalidate \\
+						-e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \\
+						-e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \\
+						jc21/ci-tools \\
+						aws cloudfront create-invalidation --distribution-id EN1G6DEWZUTDT --paths '/*'
+					"""
+				}
+			}
+		}
+		stage('PR Comment') {
+			when {
+				allOf {
+					changeRequest()
+					not {
+						equals expected: 'UNSTABLE', actual: currentBuild.result
+					}
+				}
+			}
+			steps {
+				ansiColor('xterm') {
+					script {
+						def comment = pullRequest.comment("Docker Image for build ${BUILD_NUMBER} is available on [DockerHub](https://cloud.docker.com/repository/docker/jc21/${IMAGE}) as `jc21/${IMAGE}:github-${BRANCH_LOWER}`")
+					}
+				}
+			}
+		}
+	}
+	post {
+		always {
+			sh 'docker-compose down --rmi all --remove-orphans --volumes -t 30'
+			sh 'echo Reverting ownership'
+			sh 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} chown -R $(id -u):$(id -g) /data'
+		}
+		success {
+			juxtapose event: 'success'
+			sh 'figlet "SUCCESS"'
+		}
+		failure {
+			archiveArtifacts(artifacts: 'debug/**.*', allowEmptyArchive: true)
+			juxtapose event: 'failure'
+			sh 'figlet "FAILURE"'
+		}
+		unstable {
+			archiveArtifacts(artifacts: 'debug/**.*', allowEmptyArchive: true)
+			juxtapose event: 'unstable'
+			sh 'figlet "UNSTABLE"'
+		}
+	}
 }
 
-def getPackageVersion() {
-  ver = sh(script: 'docker run --rm -v $(pwd):/data ${DOCKER_CI_TOOLS} bash -c "cat /data/package.json|jq -r \'.version\'"', returnStdout: true)
-  return ver.trim()
+def getVersion() {
+	ver = sh(script: 'cat .version', returnStdout: true)
+	return ver.trim()
+}
+
+def getCommit() {
+	ver = sh(script: 'git log -n 1 --format=%h', returnStdout: true)
+	return ver.trim()
 }
